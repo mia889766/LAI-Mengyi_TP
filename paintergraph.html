@@ -1,0 +1,653 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>PainterPalette — d3sparql Graph</title>
+
+  
+  <script src="https://d3js.org/d3.v3.min.js"></script>
+  <script src="https://biohackathon.org/d3sparql/d3sparql.js"></script>
+
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; }
+    header { padding: 12px 16px; border-bottom: 1px solid #ddd; }
+    .muted { color:#666; }
+    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    input, button { padding:8px 10px; font-size:14px; }
+    button { border:1px solid #ccc; background:#fff; border-radius:8px; }
+    button:hover { background:#f6f6f6; }
+    #svg { cursor: grab; }
+    #svg:active { cursor: grabbing; }
+    #svg { width: 100%; height: calc(100vh - 64px); display:block; }
+
+    .link { stroke: #999; stroke-opacity: 0.35; }
+    .node circle { stroke: #fff; stroke-width: 1px; }
+    .label { font-size: 11px; fill: #222; pointer-events:none; }
+  </style>
+</head>
+
+<body>
+<header>
+  <div class="row">
+    <strong>PainterPalette</strong>
+    <span class="muted">Graph</span>
+  </div>
+  <div class="row" style="margin-top:8px;">
+    <button id="btnLoad">Load Graph</button>
+    
+    <span class="muted">Find:</span>
+    <input id="searchName" placeholder="Artist name (e.g., Monet)" style="width:260px;">
+    <button id="btnFind">Search</button>
+    
+    <span class="muted" style="margin-left:8px;">View:</span>
+    <button id="btnZoomIn" title="Zoom in">+</button>
+    <button id="btnZoomOut" title="Zoom out">−</button>
+    <button id="btnFit" title="Fit to screen">Fit</button>
+    
+    <span class="muted" id="status"></span>
+  </div>
+</header>
+
+<svg id="svg"></svg>
+<div id="detail" style="position:fixed; right:12px; top:80px; width:320px; max-height:75vh; overflow:auto;
+  border:1px solid #ddd; border-radius:10px; background:#fff; padding:10px; display:none;">
+</div>
+
+<div id="legend" style="
+  position:fixed; left:12px; top:80px; width:260px;
+  border:1px solid #ddd; border-radius:10px; background:#fff;
+  padding:10px; font-size:13px; line-height:1.5;">
+  <div style="font-weight:700; margin-bottom:6px;">Legend</div>
+
+  <div style="font-weight:600; margin:8px 0 4px;">Edges (relationships)</div>
+  <div><span style="display:inline-block;width:14px;height:3px;background:#ebf309;vertical-align:middle;margin-right:8px;"></span>teachers</div>
+  <div><span style="display:inline-block;width:14px;height:3px;background:#0ac45e;vertical-align:middle;margin-right:8px;"></span>pupils</div>
+  <div><span style="display:inline-block;width:14px;height:3px;background:#999;vertical-align:middle;margin-right:8px;"></span>friends & coworkers</div>
+
+  <div style="font-weight:600; margin:10px 0 4px;">Nodes</div>
+  <div style="color:#666;">Color = movement (auto-mapped)</div>
+  <div style="color:#666;">Size = older birth year → bigger</div>
+
+  <div id="movementLegend" style="margin-top:8px;"></div>
+</div>
+
+<script>
+//  CONFIG 
+var ENDPOINT = "http://localhost:3030/PainterPalette/sparql";
+var BASE = "http://127.0.0.1:3333/";
+
+
+// GLOBAL VARS
+var __graph = null;
+var __force = null;
+var __svg = null;
+var __g = null;          // zoom/pan container
+var __zoom = null;
+
+
+function setStatus(msg){ document.getElementById("status").textContent = msg; }
+
+// SPARQL query prefix declarations (common to all queries)
+function sparqlPrefix(){
+  return [
+    "PREFIX : <" + BASE + ">",
+    "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>",
+    "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>"
+  ].join("\n");
+}
+
+// Helper for SPARQL SELECT queries with fetch API and JSON results
+function sparqlSelectFetch(query){
+  return fetch(ENDPOINT, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      "Accept": "application/sparql-results+json"
+    },
+    body: "query=" + encodeURIComponent(query)
+}).then(function(res){
+  if(!res.ok){
+    return res.text().then(function(t){
+      throw new Error("SPARQL HTTP " + res.status + " " + res.statusText + "\n" + t);
+    });
+  }
+  return res.json();
+});
+}
+
+// Query 1: load artists (nodes) with relationships
+function qArtists(){
+  return [
+    sparqlPrefix(),
+    "",
+    "SELECT DISTINCT ?artist ?name ?year ?mov WHERE {",
+    "  ?artist a :Artist ; :identity ?id .",
+    "  ?id :name ?name .",
+    "  OPTIONAL { ?artist :birth ?b . ?b :birth_year ?year . }",
+    "  OPTIONAL { ?artist :movement ?mov }",
+    "",
+    "  FILTER EXISTS {",
+    "    ?artist :relationship ?r .",
+    "    { ?r :teachers ?t } UNION { ?r :pupils ?t } UNION { ?r :friendsandcoworkers ?t }",
+    "  }",
+    "}",
+    "ORDER BY LCASE(STR(?name))"
+  ].join("\n");
+}
+  
+
+// Query 2: load edges (relationships) with target names (even if targets are not artists in the dataset)
+function qEdges(){
+  return [
+    sparqlPrefix(),
+    "",
+    "SELECT ?a1 ?name1 ?year1 ?mov1 ?relType ?targetName WHERE {",
+    "  ?a1 a :Artist ; :identity ?id1 .",
+    "  ?id1 :name ?name1 .",
+    "  OPTIONAL { ?a1 :birth ?b1 . ?b1 :birth_year ?year1 . }",
+    "  OPTIONAL { ?a1 :movement ?mov1 }",
+    "",
+    "  ?a1 :relationship ?r .",
+    "  { ?r :teachers ?targetName . BIND(\"teachers\" AS ?relType) }",
+    "  UNION",
+    "  { ?r :pupils ?targetName . BIND(\"pupils\" AS ?relType) }",
+    "  UNION",
+    "  { ?r :friendsandcoworkers ?targetName . BIND(\"friends\" AS ?relType) }",
+    "}"
+  ].join("\n");
+}
+
+// movement -> color
+function hashColor(str){
+  if(!str) return "#aaa";
+  var h = 0;
+  for(var i=0;i<str.length;i++) h = (h*31 + str.charCodeAt(i)) >>> 0;
+  var palette = ["#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd","#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf"];
+  return palette[h % palette.length];
+}
+
+// relType -> edge color
+function edgeColor(t){
+  if(t === "teachers") return "#ebf309";
+  if(t === "pupils")   return "#0ac45e";
+  if(t === "friends")  return "#999";
+  return "#bbb";
+}
+
+function normalizeName(s){
+  return String(s || "").trim().toLowerCase();
+}
+
+function makeExternalId(name){
+  return "ext:" + encodeURIComponent(String(name || "").trim());
+}
+
+// Build graph from 2 result sets:
+// - artistsRows: bindings from qArtists
+// - edgesRows: bindings from qEdges
+function buildGraphFromTwoQueries(artistsRows, edgesRows){
+  var nodeMap = {};      // id -> node
+  var nodes = [];
+  var links = [];
+
+  var nameToArtistId = {}; // normalized name -> internal artist id
+
+  function valueFromYear(y){
+    if(y === null || y === undefined || String(y).trim() === "") return 10;
+    var yi = parseInt(String(y), 10);
+    if(isNaN(yi)) return 10;
+    return Math.max(4, Math.min(80, 2026 - yi));
+  }
+
+  function getNode(id, label, year, movement, kind){
+    if(nodeMap[id]) return nodeMap[id];
+    var n = {
+      id: id,
+      label: label || id,
+      year: (year === "" ? null : year),
+      value: valueFromYear(year),
+      movement: movement || "",
+      kind: kind || "artist" // "artist" | "external"
+    };
+    nodeMap[id] = n;
+    nodes.push(n);
+    return n;
+  }
+
+  // 1) Add ALL artists as nodes 
+  (artistsRows || []).forEach(function(r){
+    var id = r.artist && r.artist.value;
+    if(!id) return;
+    var name = r.name ? r.name.value : id;
+    var year = r.year ? r.year.value : "";
+    var mov  = r.mov ? r.mov.value : "";
+    getNode(id, name, year, mov, "artist");
+    var k = normalizeName(name);
+    if(k && !nameToArtistId[k]) nameToArtistId[k] = id;
+  });
+
+  // 2) Add edges, and create external nodes when targetName is not an internal artist
+  var seenEdge = {};
+  (edgesRows || []).forEach(function(r){
+    var a1 = r.a1 && r.a1.value;
+    if(!a1) return;
+
+    var name1 = r.name1 ? r.name1.value : a1;
+    var year1 = r.year1 ? r.year1.value : "";
+    var mov1  = r.mov1 ? r.mov1.value : "";
+    var relType = r.relType ? r.relType.value : "friends";
+    var targetName = r.targetName ? r.targetName.value : "";
+    if(!targetName || !String(targetName).trim()) return;
+
+    var n1 = getNode(a1, name1, year1, mov1, "artist");
+
+    var k2 = normalizeName(targetName);
+    var internalId = nameToArtistId[k2];
+    var targetId, n2;
+    if(internalId){
+      targetId = internalId;
+      n2 = nodeMap[targetId] || getNode(targetId, targetName, "", "", "artist");
+    }else{
+      targetId = makeExternalId(targetName);
+      n2 = getNode(targetId, targetName, "", "", "external");
+    }
+
+    var key = n1.id + "||" + n2.id + "||" + relType;
+    if(seenEdge[key]) return;
+    seenEdge[key] = true;
+
+    links.push({ source: n1, target: n2, rel: relType });
+  });
+
+  return { nodes: nodes, links: links };
+}
+
+function renderForceGraph(graph){
+  __graph = graph;
+
+  var svg = d3.select("#svg");
+  svg.selectAll("*").remove(); // clear
+  __svg = svg;
+
+  var w = document.getElementById("svg").clientWidth;
+  var h = document.getElementById("svg").clientHeight;
+
+  // zoom/pan container
+  var g = svg.append("g");
+  __g = g;
+
+  __zoom = d3.behavior.zoom()
+    .scaleExtent([0.1, 6])
+    .on("zoom", function(){
+      g.attr("transform", "translate(" + d3.event.translate + ")scale(" + d3.event.scale + ")");
+    });
+  svg.call(__zoom);
+
+  var force = d3.layout.force()
+    .size([w, h])
+    .nodes(graph.nodes)
+    .links(graph.links)
+    .linkDistance(80)
+    .charge(-180)
+    .gravity(0.08)
+    .start();
+  __force = force;
+
+  var link = g.selectAll(".link")
+    .data(graph.links)
+    .enter().append("line")
+    .attr("class","link")
+    .style("stroke", function(d){ return edgeColor(d.rel); });
+
+  var drag = force.drag()
+    .on("dragstart", function(d) {
+      d3.event.sourceEvent.stopPropagation();
+    });
+
+
+  var node = g.selectAll(".node")
+    .data(graph.nodes)
+    .enter().append("g")
+    .attr("class","node")
+    .call(force.drag);
+
+  node.on("click", function(d){
+    showDetailBasic(d);
+    if(d.kind !== "external"){ loadDetailFromSparql(d.id); }
+  });
+
+  // double-click a node to open Wikipedia directly
+  node.on("dblclick", function(d){
+    if(d.label && String(d.label).trim()){
+      window.open(wikiHref(d.label), "_blank", "noopener");
+    }
+  });
+
+  var rScale = d3.scale.linear()
+    .domain(d3.extent(graph.nodes, function(d){ return d.value; }))
+    .range([4, 18]);
+
+  node.append("circle")
+    .attr("r", function(d){ return rScale(d.value); })
+    .style("fill", function(d){ return (d.kind === "external") ? "#bdbdbd" : hashColor(d.movement); })
+    .style("stroke", function(d){ return (d.kind === "external") ? "#666" : "#fff"; })
+    .style("stroke-dasharray", function(d){ return (d.kind === "external") ? "2,2" : null; });
+
+  node.append("text")
+    .attr("class","label")
+    .attr("dx", 10)
+    .attr("dy", ".35em")
+    .text(function(d){ return d.label; });
+
+  node.append("title")
+    .text(function(d){
+      return "Name: " + d.label + "\\nType: " + (d.kind || "artist")
+        + "\\nBirth year: " + (d.year || "unknown")
+        + "\\nMovement: " + (d.movement || "unknown");
+    });
+
+  force.on("tick", function(){
+    link
+      .attr("x1", function(d){ return d.source.x; })
+      .attr("y1", function(d){ return d.source.y; })
+      .attr("x2", function(d){ return d.target.x; })
+      .attr("y2", function(d){ return d.target.y; });
+
+    node.attr("transform", function(d){ return "translate(" + d.x + "," + d.y + ")"; });
+  });
+
+  setTimeout(function(){ fitGraph(); }, 350);
+}
+
+
+
+
+
+function loadGraph(){
+  setStatus("Querying artists + edges (POST) ... (large datasets may take time)");
+
+  var q1 = qArtists();
+  var q2 = qEdges();
+
+  Promise.all([sparqlSelectFetch(q1), sparqlSelectFetch(q2)])
+    .then(function(arr){
+      var artistsJson = arr[0];
+      var edgesJson   = arr[1];
+      var artistsRows = (artistsJson && artistsJson.results && artistsJson.results.bindings) ? artistsJson.results.bindings : [];
+      var edgesRows   = (edgesJson && edgesJson.results && edgesJson.results.bindings) ? edgesJson.results.bindings : [];
+
+      setStatus("Artists: " + artistsRows.length + ", Edge-rows: " + edgesRows.length + " (building graph...)");
+      var graph = buildGraphFromTwoQueries(artistsRows, edgesRows);
+      setStatus("Nodes: " + graph.nodes.length + ", Edges: " + graph.links.length);
+      renderForceGraph(graph);
+
+      try { renderMovementLegend(graph); } catch(e){ console.error("Legend error:", e); }
+    })
+    .catch(function(e){
+      console.error(e);
+      setStatus("Error. Check console.");
+      alert(e.message || String(e));
+    });
+}
+function escapeHtml(s){
+  return String(s==null?"":s)
+    .replace(/&/g,"&amp;")
+    .replace(/</g,"&lt;")
+    .replace(/>/g,"&gt;")
+    .replace(/"/g,"&quot;")
+    .replace(/'/g,"&#039;");
+}
+
+// ---- Wikipedia link helpers (simple name → URL) ----
+function wikiTitle(s){
+  return String(s || "").trim().replace(/\s+/g, "_");
+}
+function wikiHref(s){
+  return "https://en.wikipedia.org/wiki/" + encodeURIComponent(wikiTitle(s));
+}
+function wikiLinkHtml(label){
+  var t = String(label || "").trim();
+  if(!t) return "";
+  var href = wikiHref(t);
+  return '<a href="' + href + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(t) + '</a>';
+}
+// ---------------------------------------------------
+
+
+
+function showDetailBasic(d){
+  var box = document.getElementById("detail");
+  box.style.display = "block";
+
+  var nameHtml = wikiLinkHtml(d.label) || escapeHtml(d.label || "(no name)");
+  var wikiBtn = (d.label && String(d.label).trim())
+    ? `<div style="margin-top:8px;">
+         <button id="btnOpenWiki" style="padding:6px 10px; border:1px solid #ccc; background:#fff; border-radius:8px; cursor:pointer;">
+           Open Wikipedia
+         </button>
+       </div>`
+    : "";
+
+  box.innerHTML = `
+    <div style="font-weight:700;font-size:16px;">${nameHtml}</div>
+    ${wikiBtn}
+    <div style="color:#666; font-size:12px; word-break:break-all; margin-top:6px;">${escapeHtml(d.id)}</div>
+    <hr style="border:none;border-top:1px solid #eee;margin:10px 0;">
+    <div><b>Birth year:</b> ${escapeHtml(d.year || "unknown")}</div>
+    <div><b>Movement:</b> ${escapeHtml(d.movement || "unknown")}</div>
+    <div><b>Type:</b> ${escapeHtml(d.kind || "artist")}</div>
+  `;
+
+  // Bind button click (optional)
+  var btn = document.getElementById("btnOpenWiki");
+  if(btn){
+    btn.addEventListener("click", function(){
+      window.open(wikiHref(d.label), "_blank", "noopener");
+    });
+  }
+}
+function qDetails(artistIRI){
+  return [
+    "PREFIX : <" + BASE + ">",
+    "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>",
+    "SELECT ?name ?gender ?citizenship ?nationality ?movement ?type ?occupations ?locations",
+    "       ?birthPlace ?birthYear ?deathPlace ?deathYear",
+    "WHERE {",
+    "  BIND(<" + artistIRI + "> AS ?artist)",
+    "  ?artist a :Artist ; :identity ?id .",
+    "  ?id :name ?name .",
+    "  OPTIONAL { ?id :gender ?gender }",
+    "  OPTIONAL { ?id :citizenship ?citizenship }",
+    "  OPTIONAL { ?id :nationality ?nationality }",
+    "  OPTIONAL { ?artist :movement ?movement }",
+    "  OPTIONAL { ?artist :Type ?type }",
+    "  OPTIONAL { ?artist :occupations ?occupations }",
+    "  OPTIONAL { ?artist :locations ?locations }",
+    "  OPTIONAL { ?artist :birth ?b .",
+    "            OPTIONAL { ?b :birth_place ?birthPlace }",
+    "            OPTIONAL { ?b :birth_year ?birthYear } }",
+    "  OPTIONAL { ?artist :death ?d .",
+    "            OPTIONAL { ?d :death_place ?deathPlace }",
+    "            OPTIONAL { ?d :death_year ?deathYear } }",
+    "}",
+    "LIMIT 1"
+  ].join("\n");
+}
+
+const __detailCache = new Map(); // artistIRI -> html string
+
+function loadDetailFromSparql(artistIRI){
+  if(__detailCache.has(artistIRI)){
+    document.getElementById("detail").innerHTML = __detailCache.get(artistIRI);
+    return;
+  }
+
+  // loading
+  var box = document.getElementById("detail");
+  box.style.display = "block";
+  box.innerHTML += `<div style="margin-top:10px;color:#666;">Loading full details...</div>`;
+
+  d3sparql.query(ENDPOINT, qDetails(artistIRI), function(json){
+    try{
+      var rows = json.results.bindings;
+      if(!rows.length){
+        box.innerHTML += `<div style="color:#666;">No extra details.</div>`;
+        return;
+      }
+      var r = rows[0];
+
+      function v(k){ return r[k] ? r[k].value : ""; }
+      var html = `
+        <div style="font-weight:700;font-size:16px;">${(wikiLinkHtml(v("name")) || escapeHtml(v("name") || "(no name)"))}</div>
+        ${v("name") ? `<div style="margin-top:8px;"><button id="btnOpenWiki" style="padding:6px 10px; border:1px solid #ccc; background:#fff; border-radius:8px; cursor:pointer;">Open Wikipedia</button></div>` : ""}
+        <div style="color:#666; font-size:12px; word-break:break-all; margin-top:6px;">${escapeHtml(artistIRI)}</div>
+        <hr style="border:none;border-top:1px solid #eee;margin:10px 0;">
+        <div><b>Gender:</b> ${escapeHtml(v("gender") || "none")}</div>
+        <div><b>Citizenship:</b> ${escapeHtml(v("citizenship") || "none")}</div>
+        <div><b>Nationality:</b> ${escapeHtml(v("nationality") || "none")}</div>
+        <div><b>Movement:</b> ${escapeHtml(v("movement") || "none")}</div>
+        <div><b>Type:</b> ${escapeHtml(v("type") || "none")}</div>
+        <div><b>Occupations:</b> ${escapeHtml(v("occupations") || "none")}</div>
+        <div><b>Locations:</b> ${escapeHtml(v("locations") || "none")}</div>
+        <hr style="border:none;border-top:1px solid #eee;margin:10px 0;">
+        <div><b>Birth:</b> ${escapeHtml((v("birthPlace")||"") + (v("birthYear")?(" ("+v("birthYear")+")"):"") || "none")}</div>
+        <div><b>Death:</b> ${escapeHtml((v("deathPlace")||"") + (v("deathYear")?(" ("+v("deathYear")+")"):"") || "none")}</div>
+      `;
+
+      __detailCache.set(artistIRI, html);
+      box.innerHTML = html;
+      var btn = document.getElementById("btnOpenWiki");
+      if(btn){
+        btn.addEventListener("click", function(){
+          var nm = v("name");
+          if(nm && String(nm).trim()) window.open(wikiHref(nm), "_blank", "noopener");
+        });
+      }
+    }catch(e){
+      console.error(e);
+      box.innerHTML += `<div style="color:#c00;">Detail error. Check console.</div>`;
+    }
+  });
+}
+
+function renderMovementLegend(graph){
+  var box = document.getElementById("movementLegend");
+  if(!box) return;
+
+  if(!graph || !graph.nodes || !graph.nodes.length){
+    box.innerHTML = '<div style="color:#666;">No nodes.</div>';
+    return;
+  }
+
+  var counts = {};
+  graph.nodes.forEach(function(n){
+    var m = (n.movement || "").trim();
+    if(!m) m = "(no movement)";
+    counts[m] = (counts[m] || 0) + 1;
+  });
+
+  var items = Object.keys(counts)
+    .map(function(k){ return { movement:k, count:counts[k] }; })
+    .sort(function(a,b){ return b.count - a.count; })
+    .slice(0, 12);
+
+  if(items.length === 0){
+    box.innerHTML = '<div style="color:#666;">No movement data.</div>';
+    return;
+  }
+
+  box.innerHTML =
+    '<div style="font-weight:600;margin-bottom:4px;">Top movements</div>' +
+    items.map(function(it){
+      var mv = it.movement;
+      var color = (mv === "(no movement)") ? "#aaa" : hashColor(mv);
+      return (
+        '<div style="display:flex; align-items:center; gap:8px; margin:3px 0;">' +
+          '<span style="width:10px;height:10px;border-radius:50%;background:'+ color +';display:inline-block;"></span>' +
+          '<span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="'+ escapeHtml(mv) +'">' +
+            escapeHtml(mv) +
+          '</span>' +
+          '<span style="color:#666;">' + it.count + '</span>' +
+        '</div>'
+      );
+    }).join("");
+}
+
+function fitGraph(){
+  if(!__svg || !__g || !__zoom || !__graph) return;
+
+  var svgNode = document.getElementById("svg");
+  var w = svgNode.clientWidth;
+  var h = svgNode.clientHeight;
+
+  var xs = __graph.nodes.map(function(n){ return n.x; }).filter(function(x){ return isFinite(x); });
+  var ys = __graph.nodes.map(function(n){ return n.y; }).filter(function(y){ return isFinite(y); });
+  if(xs.length === 0 || ys.length === 0) return;
+
+  var minX = Math.min.apply(null, xs), maxX = Math.max.apply(null, xs);
+  var minY = Math.min.apply(null, ys), maxY = Math.max.apply(null, ys);
+
+  var dx = (maxX - minX) || 1;
+  var dy = (maxY - minY) || 1;
+
+  var scale = 0.9 / Math.max(dx / w, dy / h);
+  scale = Math.max(0.1, Math.min(6, scale));
+
+  var tx = (w - scale * (minX + maxX)) / 2;
+  var ty = (h - scale * (minY + maxY)) / 2;
+
+  __zoom.translate([tx, ty]).scale(scale);
+  __g.attr("transform", "translate(" + tx + "," + ty + ")scale(" + scale + ")");
+}
+
+function zoomBy(factor){
+  if(!__zoom || !__g) return;
+  var s = __zoom.scale() * factor;
+  s = Math.max(0.1, Math.min(6, s));
+  __zoom.scale(s);
+  __g.attr("transform", "translate(" + __zoom.translate() + ")scale(" + s + ")");
+}
+
+function findByName(){
+  var q = (document.getElementById("searchName").value || "").trim().toLowerCase();
+  if(!q || !__graph) return;
+
+  var found = null;
+  for(var i=0;i<__graph.nodes.length;i++){
+    var lab = String(__graph.nodes[i].label || "").toLowerCase();
+    if(lab === q || lab.indexOf(q) !== -1){
+      found = __graph.nodes[i];
+      break;
+    }
+  }
+  if(!found){
+    alert("Not found: " + q);
+    return;
+  }
+
+  var svgNode = document.getElementById("svg");
+  var w = svgNode.clientWidth;
+  var h = svgNode.clientHeight;
+  var s = Math.max(__zoom ? __zoom.scale() : 1, 1.6);
+  var tx = w/2 - s * found.x;
+  var ty = h/2 - s * found.y;
+
+  if(__zoom && __g){
+    __zoom.translate([tx, ty]).scale(s);
+    __g.attr("transform", "translate(" + tx + "," + ty + ")scale(" + s + ")");
+  }
+
+  showDetailBasic(found);
+  if(found.kind !== "external"){ loadDetailFromSparql(found.id); }
+}
+
+document.getElementById("btnLoad").addEventListener("click", loadGraph);
+document.getElementById("btnFind").addEventListener("click", findByName);
+document.getElementById("searchName").addEventListener("keydown", function(ev){ if(ev.key === "Enter") findByName(); });
+document.getElementById("btnZoomIn").addEventListener("click", function(){ zoomBy(1.25); });
+document.getElementById("btnZoomOut").addEventListener("click", function(){ zoomBy(0.8); });
+document.getElementById("btnFit").addEventListener("click", fitGraph);
+
+</script>
+</body>
+</html>
